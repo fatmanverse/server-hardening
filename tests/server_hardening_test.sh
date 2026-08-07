@@ -1646,6 +1646,38 @@ EOF
     rm -rf "$tmp"
 }
 
+operator_prompts_do_not_consume_loop_stdin() {
+    load_script || return 1
+    # These loops call resolve_conflict, which prompts on stdin. Their data
+    # stream must use another descriptor, or the prompt reads usernames as
+    # answers and then fails on EOF, aborting and rolling back the transaction.
+    if awk '/^apply_managed_accounts\(\) \{/,/^\}/' "$MODULE_DIR/accounts.sh" \
+        | grep -qE 'done[[:space:]]*<[[:space:]]*<\('; then
+        fail 'apply_managed_accounts 的用户名流必须使用独立描述符'
+        return 1
+    fi
+    if awk '/^apply_account_policies\(\) \{/,/^\}/' "$MODULE_DIR/hardening.sh" \
+        | grep -qE 'done[[:space:]]*<[[:space:]]*<\('; then
+        fail 'apply_account_policies 的用户名流必须使用独立描述符'
+        return 1
+    fi
+    # A prompt nested in such a loop must still receive the operator's answer.
+    local decision
+    decision=$(printf '2\n' | bash -c "
+        source '$MODULE_DIR/core.sh' 2>/dev/null
+        source '$MODULE_DIR/cli.sh' 2>/dev/null
+        source '$MODULE_DIR/state.sh' 2>/dev/null
+        reset_options 2>/dev/null
+        CONFLICT_ACTION=''
+        DECISION_LOG_READY=0
+        while IFS= read -r user <&3; do
+            resolve_conflict \"aging.\$user\" \"账户 \$user\" a b impact >/dev/null 2>&1 || exit 1
+        done 3< <(printf 'alice\n')
+        printf '%s' \"\$CONFLICT_DECISION\"") \
+        || { fail '嵌套循环中的冲突提示应读到操作者输入'; return 1; }
+    assert_eq skip "$decision" '嵌套提示读取操作者选择' || return 1
+}
+
 modular_layout_is_complete_and_entry_is_short() {
     local module lines count
     lines=$(wc -l < "$SCRIPT" | tr -d ' ')
@@ -1858,6 +1890,7 @@ run_test '模块布局完整且入口保持精简' modular_layout_is_complete_an
 run_test '模块缺失时在执行前明确失败' missing_module_fails_before_execution
 run_test '从其他工作目录加载模块' entry_loads_modules_from_other_working_directory
 run_test '服务器加固目录是唯一源码' canonical_package_has_no_root_duplicates
+run_test '操作者提示不消费循环 stdin' operator_prompts_do_not_consume_loop_stdin
 run_test '未实测平台需显式确认风险' unverified_platform_requires_explicit_opt_in
 run_test 'ID_LIKE 匹配不做通配展开' id_like_matching_does_not_expand_globs
 run_test '不支持的平台在向导前拒绝' unsupported_platform_is_rejected_before_wizard

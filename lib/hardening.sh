@@ -601,10 +601,12 @@ apply_account_policies() {
         fi
     fi
     if [[ "$APPLY_AGING_EXISTING" == yes ]]; then
-        while IFS= read -r user; do
+        # Read on fd 3: ensure_password_aging prompts the operator through
+        # resolve_conflict, which reads stdin.
+        while IFS= read -r user <&3; do
             [[ -n "$user" ]] || continue
             ensure_password_aging "$user" "$PASS_MAX_DAYS" "$PASS_MIN_DAYS" "$PASS_WARN_AGE" || return 1
-        done < <(list_regular_users)
+        done 3< <(list_regular_users)
     fi
 }
 

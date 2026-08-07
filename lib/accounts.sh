@@ -296,7 +296,9 @@ apply_managed_accounts() {
     local user description password admin_group
     admin_group=wheel
     [[ "$PLATFORM_FAMILY" == debian ]] && admin_group=sudo
-    while IFS= read -r user; do
+    # Read on fd 3: the loop body prompts the operator through resolve_conflict,
+    # which reads stdin.
+    while IFS= read -r user <&3; do
         description=$(managed_account_description "$user")
         if local_account_exists "$user"; then
             ensure_account_shell "$user" || return 1
@@ -322,7 +324,7 @@ apply_managed_accounts() {
                 remove_account_from_admin_groups "$user" || return 1
                 ;;
         esac
-    done < <(managed_account_names)
+    done 3< <(managed_account_names)
 }
 
 install_authorized_key() {
