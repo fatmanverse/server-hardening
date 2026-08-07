@@ -289,6 +289,40 @@ platform_family_from_os_release() {
     printf '%s\n' "$family"
 }
 
+# Derived platforms share a verified family's PAM layout but have not been
+# tested here, so entering one is an explicit operator decision. Reads from the
+# terminal directly: stdin may be a pipe from a caller's `while read` loop.
+confirm_unverified_platform() {
+    local answer
+    (( ! ALLOW_UNVERIFIED_PLATFORM )) || return 0
+    warn "未实测的平台: $PLATFORM_ID $PLATFORM_VERSION -> $PLATFORM_FAMILY"
+    warn "判定依据: $PLATFORM_REASON"
+    if (( NON_INTERACTIVE )); then
+        die "非交互模式下如确认承担风险，请追加 --allow-unverified-platform 重新执行"
+    fi
+    # -r only tests permission: cron and PTY-less SSH can pass it and still fail
+    # to open with ENXIO. Open the terminal to prove a controlling one exists.
+    # The brace group keeps 2>/dev/null off the shell itself; a bare
+    # `exec ... 2>/dev/null` would silence every later warn and die.
+    if ! { exec 9<>/dev/tty; } 2>/dev/null; then
+        die "当前进程没有可用的控制终端；如确认承担风险，请追加 --allow-unverified-platform 重新执行"
+    fi
+    # The menu goes to the terminal, not stderr: a redirected stderr would hide
+    # the prompt while the read still waits, which just looks like a hang.
+    printf '\n本平台的 PAM 布局与已验证平台同源，但未经本项目实测。\n' >&9
+    printf '继续将修改 SSH、PAM 与账户策略；失败会自动回滚，但仍存在锁定登录的风险。\n' >&9
+    if ! answer=$(ask_menu '是否在该平台上继续' abort \
+        abort '中止本次加固（推荐先在测试机验证）' \
+        continue '我已了解风险，继续执行' <&9 2>&9); then
+        exec 9>&-
+        die "读取平台确认失败"
+    fi
+    exec 9>&-
+    [[ "$answer" == continue ]] || die "已按操作者选择中止；未做任何修改"
+    # Persist so the second detect_platform call does not ask again.
+    ALLOW_UNVERIFIED_PLATFORM=1
+}
+
 detect_platform() {
     local file=${OS_RELEASE_FILE:-$(root_path /etc/os-release)}
     [[ -r "$file" ]] || die "无法读取 $file"
@@ -316,14 +350,11 @@ detect_platform() {
             ;;
     esac
     if [[ "$PLATFORM_TIER" == derived ]]; then
-        if (( ! ALLOW_UNVERIFIED_PLATFORM )); then
-            warn "未实测的平台: $PLATFORM_ID $PLATFORM_VERSION -> $PLATFORM_FAMILY（$PLATFORM_REASON）"
-            die "如确认承担风险，请追加 --allow-unverified-platform 重新执行"
-        fi
+        confirm_unverified_platform
         # detect_platform runs before the wizard and again from apply_hardening.
         if (( ! PLATFORM_WARNED )); then
             warn "平台未经本项目实测: $PLATFORM_ID $PLATFORM_VERSION -> $PLATFORM_FAMILY（$PLATFORM_REASON）"
-            warn "已按 --allow-unverified-platform 继续；PAM 结构校验仍会强制执行"
+            warn "已确认承担风险并继续；PAM 结构校验仍会强制执行"
         fi
     fi
     if [[ "$PLATFORM_FAMILY" == rhel7 ]] && (( ! PLATFORM_WARNED )); then

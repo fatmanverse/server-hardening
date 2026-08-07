@@ -1755,10 +1755,11 @@ unverified_platform_requires_explicit_opt_in() {
         SYSTEM_ROOT="$tmp"
         OS_RELEASE_FILE="$tmp/etc/os-release"
         ALLOW_UNVERIFIED_PLATFORM=0
+        NON_INTERACTIVE=1
         detect_platform 2>&1
     )
     status=$?
-    (( status != 0 )) || { rm -rf "$tmp"; fail 'CentOS 8 缺少 --allow-unverified-platform 时必须拒绝'; return 1; }
+    (( status != 0 )) || { rm -rf "$tmp"; fail 'CentOS 8 非交互且缺少 --allow-unverified-platform 时必须拒绝'; return 1; }
     assert_contains "$output" '--allow-unverified-platform' '拒绝信息应指明所需参数' || { rm -rf "$tmp"; return 1; }
 
     output=$(
@@ -1809,6 +1810,37 @@ id_like_matching_does_not_expand_globs() {
         [[ "$(platform_classification_tier "$tmp/os-release")" == unsupported ]]
     ) || { rm -rf "$tmp"; fail 'ID_LIKE="*" 不得推断出受支持家族'; return 1; }
     rm -rf "$tmp"
+}
+
+platform_confirmation_keeps_stderr_open() {
+    # `exec 9<>/dev/tty 2>/dev/null` applies the redirection permanently, so a
+    # bare form silences every later warn and die -- on the success path too.
+    # bash -n cannot catch it, so assert the redirection stays scoped.
+    local body
+    body=$(awk '/^confirm_unverified_platform\(\) \{/,/^\}/' "$MODULE_DIR/hardening.sh")
+    [[ -n "$body" ]] || { fail '找不到 confirm_unverified_platform'; return 1; }
+    if grep -qE '^[[:space:]]*(if !)?[[:space:]]*exec[[:space:]]+9<>[^|]*2>' <<< "$body"; then
+        fail 'exec 打开终端时不能直接附加 2> 重定向，否则会永久静默 stderr'
+        return 1
+    fi
+    assert_contains "$body" '{ exec 9<>/dev/tty; } 2>/dev/null' \
+        '打开终端的重定向必须限制在花括号组内' || return 1
+    # Both exit paths must close the descriptor.
+    local closes
+    closes=$(grep -c 'exec 9>&-' <<< "$body")
+    (( closes >= 2 )) || { fail "fd 9 必须在成功和失败路径都关闭（实际=${closes}）"; return 1; }
+
+    # Prove it at runtime: stderr must survive a failed terminal open.
+    local output
+    output=$(bash -c '
+        set -euo pipefail
+        warn() { printf "[WARN] %s\n" "$*" >&2; }
+        if ! { exec 9<>/dev/nonexistent-tty-probe; } 2>/dev/null; then
+            warn CAUGHT
+        fi
+        warn STDERR_ALIVE
+    ' 2>&1) || { fail '受控 exec 探测应能恢复'; return 1; }
+    assert_contains "$output" 'STDERR_ALIVE' '失败的终端打开后 stderr 必须仍可用' || return 1
 }
 
 unsupported_platform_is_rejected_before_wizard() {
@@ -1892,6 +1924,7 @@ run_test '从其他工作目录加载模块' entry_loads_modules_from_other_work
 run_test '服务器加固目录是唯一源码' canonical_package_has_no_root_duplicates
 run_test '操作者提示不消费循环 stdin' operator_prompts_do_not_consume_loop_stdin
 run_test '未实测平台需显式确认风险' unverified_platform_requires_explicit_opt_in
+run_test '平台确认不永久重定向 stderr' platform_confirmation_keeps_stderr_open
 run_test 'ID_LIKE 匹配不做通配展开' id_like_matching_does_not_expand_globs
 run_test '不支持的平台在向导前拒绝' unsupported_platform_is_rejected_before_wizard
 

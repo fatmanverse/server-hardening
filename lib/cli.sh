@@ -20,7 +20,7 @@ usage() {
     CentOS 7（脚本仍完整支持；但系统已停止上游安全更新）
     RHEL / Rocky Linux / AlmaLinux 8 / 9
 
-  PAM 布局同源、未实测（需 --allow-unverified-platform）:
+  PAM 布局同源、未实测（交互确认后可运行）:
     CentOS 8 / 9 / 10、CentOS Stream
     RHEL / Rocky / AlmaLinux 10
     Oracle Linux 7 / 8 / 9 / 10
@@ -78,7 +78,8 @@ usage() {
   --rollback-timeout SECONDS
   --conflict-action overwrite|skip|fail      非交互默认 fail
   --install-packages
-  --allow-unverified-platform                允许在 PAM 布局同源但未实测的发行版上运行
+  --allow-unverified-platform                预先确认在未实测发行版上运行，跳过交互确认
+                                             非交互模式在此类平台上必须显式指定
   --non-interactive
   --dry-run
   --help
