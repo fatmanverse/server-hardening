@@ -42,6 +42,11 @@ readonly SYSINFO_COLLECTOR_MODE='0755'
 readonly SYSINFO_PROFILE_MODE='0644'
 readonly CREDENTIAL_BUNDLE_PATH='/opt/server-hardening/credentials.txt'
 readonly MANAGED_ACCOUNT_PASSWORD_LENGTH=8
+# Upper bounds of the known-compatible window. Releases beyond these are
+# rejected until their PAM layout has been checked, because a newer major can
+# change PAM ownership without renaming any file.
+readonly MAX_KNOWN_UBUNTU_MAJOR=26
+readonly MAX_KNOWN_FEDORA_MAJOR=44
 
 INVOCATION_DIR=$(pwd -P)
 INVOKING_UID=${SUDO_UID:-$(id -u)}

@@ -14,12 +14,34 @@ usage() {
   server_hardening.sh --rollback TRANSACTION # 手动回滚
 
 支持的发行版:
-  Ubuntu 18.04 / 20.04 / 22.04 / 24.04
-  Debian 10 / 11 / 12
-  CentOS 7（脚本仍完整支持；但系统已停止上游安全更新）
-  RHEL / Rocky Linux / AlmaLinux 8 / 9
+  已实测（直接运行）:
+    Ubuntu 18.04 / 20.04 / 22.04 / 24.04
+    Debian 10 / 11 / 12
+    CentOS 7（脚本仍完整支持；但系统已停止上游安全更新）
+    RHEL / Rocky Linux / AlmaLinux 8 / 9
 
-  其他版本会明确拒绝，不以“更高版本应该兼容”作为隐式假设。
+  PAM 布局同源、未实测（需 --allow-unverified-platform）:
+    CentOS 8 / 9 / 10、CentOS Stream
+    RHEL / Rocky / AlmaLinux 10
+    Oracle Linux 7 / 8 / 9 / 10
+    Fedora 36-44
+    Amazon Linux 2 / 2023
+    Anolis OS 8 / 23 / 25
+    EL 重打包: EuroLinux、Circle、NavyLinux、Springdale、CloudLinux、MiracleLinux
+    Debian 13、Ubuntu 非 LTS（至 26.x）
+    Debian 衍生: Linux Mint、Pop!_OS、Zorin、elementary、Kali、Raspbian、Devuan
+    其他 ID_LIKE 命中 debian 或 rhel/centos/fedora 的未知发行版
+
+  明确拒绝:
+    openEuler   PAM 由厂商策略管理，authselect 接管可能导致 root 无法登录
+    Kylin / UOS / Deepin  同一 ID 覆盖多种底层，无法安全推断 PAM 布局
+    SUSE 系     使用 pam-config，与本脚本实现不兼容
+    Alpine      默认不使用 glibc/PAM 认证栈
+    Arch 系     滚动更新，无稳定 PAM 布局合同
+
+  平台识别只决定"候选家族"；实际写入前仍强制校验 PAM 结构
+  （authselect check、CentOS 7 symlink 布局、Debian 标准控制流），
+  校验不通过一律拒绝，不做降级猜测。
 
 部署要求:
   必须完整复制 server_hardening.sh 和同目录 lib/ 模块目录。
@@ -56,6 +78,7 @@ usage() {
   --rollback-timeout SECONDS
   --conflict-action overwrite|skip|fail      非交互默认 fail
   --install-packages
+  --allow-unverified-platform                允许在 PAM 布局同源但未实测的发行版上运行
   --non-interactive
   --dry-run
   --help
@@ -126,6 +149,10 @@ reset_options() {
     PLATFORM_FAMILY=''
     PLATFORM_ID=''
     PLATFORM_VERSION=''
+    PLATFORM_TIER=''
+    PLATFORM_REASON=''
+    PLATFORM_WARNED=0
+    ALLOW_UNVERIFIED_PLATFORM=0
     SSH_SERVICE=''
     PAM_LOCKOUT_MODULE=''
     PAM_LOCKOUT_WAS_MANAGED=0
@@ -176,6 +203,7 @@ parse_args() {
             --rollback-timeout) ROLLBACK_TIMEOUT=${2:-}; shift 2 ;;
             --conflict-action) CONFLICT_ACTION=${2:-}; shift 2 ;;
             --install-packages) INSTALL_PACKAGES=1; shift ;;
+            --allow-unverified-platform) ALLOW_UNVERIFIED_PLATFORM=1; shift ;;
             --non-interactive) NON_INTERACTIVE=1; shift ;;
             --dry-run) DRY_RUN=1; shift ;;
             --confirm) CONFIRM_TRANSACTION=${2:-}; shift 2 ;;

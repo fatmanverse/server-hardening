@@ -126,11 +126,31 @@ supported_platforms_are_detected() {
         fail "不支持的发行版应该失败"
         return 1
     fi
-    for distro in 'ubuntu:25.04' 'debian:13' 'centos:8' 'rhel:10' 'rocky:10' 'almalinux:10'; do
-        file="$tmp/${distro/:/-}"
+    # PAM layout matches a verified family, so these classify as derived and
+    # need --allow-unverified-platform rather than being rejected outright.
+    local expected_family
+    for distro in 'ubuntu:25.04:debian' 'debian:13:debian' 'centos:8:rhel8plus' \
+        'rhel:10:rhel8plus' 'rocky:10:rhel8plus' 'almalinux:10:rhel8plus' \
+        'fedora:40:rhel8plus' 'amzn:2023:rhel8plus' 'amzn:2:rhel7' 'ol:9.6:rhel8plus'; do
+        file="$tmp/derived-${distro//:/-}"
+        expected_family=${distro##*:}
+        printf 'ID=%s\nVERSION_ID="%s"\n' "${distro%%:*}" "$(cut -d: -f2 <<<"$distro")" > "$file"
+        assert_eq "$expected_family" "$(platform_classification_family "$file")" \
+            "$distro 候选家族" || { rm -rf "$tmp"; return 1; }
+        assert_eq derived "$(platform_classification_tier "$file")" \
+            "$distro 应标记为未实测" || { rm -rf "$tmp"; return 1; }
+    done
+    # Vendor-managed or non-PAM stacks stay rejected: an ID_LIKE match is not
+    # evidence that the PAM layout can be safely taken over.
+    for distro in 'openEuler:22.03' 'kylin:V10' 'uos:20' 'sles:15.6' 'alpine:3.22' \
+        'ubuntu:27.04' 'debian:14' 'rhel:11' 'fedora:45'; do
+        file="$tmp/reject-${distro//:/-}"
         printf 'ID=%s\nVERSION_ID="%s"\n' "${distro%%:*}" "${distro#*:}" > "$file"
+        assert_eq unsupported "$(platform_classification_tier "$file")" \
+            "$distro 应被拒绝" || { rm -rf "$tmp"; return 1; }
         if platform_family_from_os_release "$file" >/dev/null 2>&1; then
-            fail "未经验证的 $distro 应被拒绝"
+            fail "不支持的 $distro 应被拒绝"
+            rm -rf "$tmp"
             return 1
         fi
     done
@@ -1630,11 +1650,11 @@ modular_layout_is_complete_and_entry_is_short() {
     local module lines count
     lines=$(wc -l < "$SCRIPT" | tr -d ' ')
     (( lines <= 200 )) || { fail "入口脚本超过 200 行（实际=${lines}）"; return 1; }
-    for module in core cli state accounts artifacts ssh pam transaction hardening; do
+    for module in core cli state accounts artifacts ssh pam transaction hardening sysinfo; do
         [[ -r "$MODULE_DIR/$module.sh" ]] || { fail "缺少模块: $MODULE_DIR/$module.sh"; return 1; }
     done
     count=$(find "$MODULE_DIR" -maxdepth 1 -type f -name '*.sh' | wc -l | tr -d ' ')
-    assert_eq 9 "$count" "模块数量" || return 1
+    assert_eq 10 "$count" "模块数量" || return 1
     assert_eq 'server_hardening.sh 2.0.0' "$(bash "$SCRIPT" --version)" "模块化版本号"
 }
 
@@ -1671,6 +1691,109 @@ entry_loads_modules_from_other_working_directory() {
 canonical_package_has_no_root_duplicates() {
     [[ ! -e "$ROOT_DIR/server_hardening.sh" ]] || { fail "根目录不应保留重复入口"; return 1; }
     [[ ! -e "$ROOT_DIR/lib" ]] || { fail "根目录不应保留重复模块目录"; return 1; }
+}
+
+stub_platform_commands() {
+    local dir="$1" command
+    mkdir -p "$dir/bin"
+    cat > "$dir/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == list-unit-files ]]; then
+    printf 'ssh.service enabled\nsshd.service enabled\n'
+fi
+exit 0
+EOF
+    chmod +x "$dir/bin/systemctl"
+    for command in sshd tar flock; do
+        ln -sf "$dir/bin/systemctl" "$dir/bin/$command"
+    done
+}
+
+unverified_platform_requires_explicit_opt_in() {
+    load_script || return 1
+    local tmp output status
+    tmp=$(mktemp -d)
+    stub_platform_commands "$tmp"
+    mkdir -p "$tmp/etc"
+    printf 'ID=centos\nVERSION_ID="8"\n' > "$tmp/etc/os-release"
+
+    output=$(
+        reset_options
+        PATH="$tmp/bin:$PATH"
+        SYSTEM_ROOT="$tmp"
+        OS_RELEASE_FILE="$tmp/etc/os-release"
+        ALLOW_UNVERIFIED_PLATFORM=0
+        detect_platform 2>&1
+    )
+    status=$?
+    (( status != 0 )) || { rm -rf "$tmp"; fail 'CentOS 8 缺少 --allow-unverified-platform 时必须拒绝'; return 1; }
+    assert_contains "$output" '--allow-unverified-platform' '拒绝信息应指明所需参数' || { rm -rf "$tmp"; return 1; }
+
+    output=$(
+        reset_options
+        PATH="$tmp/bin:$PATH"
+        SYSTEM_ROOT="$tmp"
+        OS_RELEASE_FILE="$tmp/etc/os-release"
+        ALLOW_UNVERIFIED_PLATFORM=1
+        detect_platform 2>&1 && printf 'family=%s\n' "$PLATFORM_FAMILY"
+    ) || { rm -rf "$tmp"; fail '带 --allow-unverified-platform 时 CentOS 8 应继续'; return 1; }
+    assert_contains "$output" 'family=rhel8plus' 'CentOS 8 应归入 rhel8plus' || { rm -rf "$tmp"; return 1; }
+
+    # 明确拒绝的厂商托管平台不受该参数影响。
+    printf 'ID=openEuler\nVERSION_ID="22.03"\n' > "$tmp/etc/os-release"
+    output=$(
+        reset_options
+        PATH="$tmp/bin:$PATH"
+        SYSTEM_ROOT="$tmp"
+        OS_RELEASE_FILE="$tmp/etc/os-release"
+        ALLOW_UNVERIFIED_PLATFORM=1
+        detect_platform 2>&1
+    )
+    status=$?
+    (( status != 0 )) || { rm -rf "$tmp"; fail 'openEuler 即使带参数也必须拒绝'; return 1; }
+    assert_contains "$output" '不支持的系统' 'openEuler 应报告为不支持' || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
+}
+
+id_like_matching_does_not_expand_globs() {
+    load_script || return 1
+    local tmp
+    tmp=$(mktemp -d)
+    # A glob in ID_LIKE must not be expanded against the filesystem, otherwise a
+    # file named after a supported family would forge a match.
+    ( cd "$tmp" && touch rhel debian fedora )
+    (
+        cd "$tmp" || exit 1
+        id_like_contains '*' rhel && exit 1
+        id_like_contains '?hel' rhel && exit 1
+        id_like_contains 'rhel fedora' rhel || exit 1
+        id_like_contains 'RHEL' rhel || exit 1
+        exit 0
+    ) || { rm -rf "$tmp"; fail 'ID_LIKE 匹配不得进行路径展开'; return 1; }
+
+    printf 'ID=unknowncorp\nVERSION_ID="1"\nID_LIKE="*"\n' > "$tmp/os-release"
+    (
+        cd "$tmp" || exit 1
+        [[ "$(platform_classification_tier "$tmp/os-release")" == unsupported ]]
+    ) || { rm -rf "$tmp"; fail 'ID_LIKE="*" 不得推断出受支持家族'; return 1; }
+    rm -rf "$tmp"
+}
+
+unsupported_platform_is_rejected_before_wizard() {
+    local tmp output status
+    tmp=$(mktemp -d)
+    stub_platform_commands "$tmp"
+    mkdir -p "$tmp/etc"
+    printf 'ID=openEuler\nVERSION_ID="22.03"\n' > "$tmp/etc/os-release"
+    # No TTY and no policy options: reaching the wizard would fail on the TTY
+    # check instead, so the platform message proves the ordering.
+    output=$(SYSTEM_ROOT="$tmp" OS_RELEASE_FILE="$tmp/etc/os-release" \
+        PATH="$tmp/bin:$PATH" bash "$SCRIPT" </dev/null 2>&1)
+    status=$?
+    (( status != 0 )) || { rm -rf "$tmp"; fail '不支持的平台必须以非零状态退出'; return 1; }
+    assert_contains "$output" '不支持的系统' '应先报告平台不支持' || { rm -rf "$tmp"; return 1; }
+    assert_not_contains "$output" '交互模式需要 TTY' '平台检查必须早于交互向导' || { rm -rf "$tmp"; return 1; }
+    rm -rf "$tmp"
 }
 
 run_test 'sh 误用时提示改用 Bash' sh_invocation_reports_bash_requirement
@@ -1735,6 +1858,9 @@ run_test '模块布局完整且入口保持精简' modular_layout_is_complete_an
 run_test '模块缺失时在执行前明确失败' missing_module_fails_before_execution
 run_test '从其他工作目录加载模块' entry_loads_modules_from_other_working_directory
 run_test '服务器加固目录是唯一源码' canonical_package_has_no_root_duplicates
+run_test '未实测平台需显式确认风险' unverified_platform_requires_explicit_opt_in
+run_test 'ID_LIKE 匹配不做通配展开' id_like_matching_does_not_expand_globs
+run_test '不支持的平台在向导前拒绝' unsupported_platform_is_rejected_before_wizard
 
 printf '1..%d\n' "$TESTS_RUN"
 if (( TESTS_FAILED > 0 )); then

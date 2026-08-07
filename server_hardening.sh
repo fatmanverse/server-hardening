@@ -62,6 +62,7 @@ main() {
         manual_rollback
         return 0
     fi
+    detect_platform
     if should_run_interactive_wizard; then
         interactive_wizard
     fi

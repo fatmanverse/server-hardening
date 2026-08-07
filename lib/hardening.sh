@@ -69,25 +69,224 @@ read_os_release_value() {
     return 1
 }
 
-platform_family_from_os_release() {
-    local file="$1" id version major
-    [[ -r "$file" ]] || return 1
-    id=$(read_os_release_value "$file" ID) || return 1
-    version=$(read_os_release_value "$file" VERSION_ID) || return 1
+os_release_id_like() {
+    local file="$1"
+    read_os_release_value "$file" ID_LIKE 2>/dev/null || true
+}
+
+version_major_number() {
+    local version="$1" major
+    version=${version#[Vv]}
     major=${version%%.*}
+    is_uint "$major" || return 1
+    printf '%d\n' "$((10#$major))"
+}
+
+# Matches a whole space-delimited token. Word splitting an untrusted ID_LIKE
+# would also glob-expand it, so "*" could match files in the working directory.
+id_like_contains() {
+    local id_like expected="$2"
+    id_like=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -s '[:space:]' ' ')
+    case " $id_like " in
+        *" $expected "*) return 0 ;;
+    esac
+    return 1
+}
+
+# Emits: family<TAB>tier<TAB>reason. tier is verified, derived or unsupported.
+classify_platform() {
+    local family="$1" tier="$2" reason="$3"
+    printf '%s\t%s\t%s\n' "$family" "$tier" "$reason"
+}
+
+# Debian derivatives keep /etc/pam.d/common-* and pam-auth-update.
+classify_debian_like_platform() {
+    local id="$1" version="$2" major="$3"
     case "$id" in
         ubuntu)
-            case "$version" in 18.04|20.04|22.04|24.04) printf 'debian\n' ;; *) return 1 ;; esac
+            case "$version" in
+                18.04|20.04|22.04|24.04)
+                    classify_platform debian verified '已验证的 Ubuntu LTS'
+                    ;;
+                *)
+                    if [[ -n "$major" ]] && (( major >= 18 && major <= MAX_KNOWN_UBUNTU_MAJOR )); then
+                        classify_platform debian derived "Ubuntu $version 未经本项目实测，PAM 布局与已验证 LTS 相同"
+                    else
+                        classify_platform '' unsupported "Ubuntu $version 超出已知兼容区间（18.04-${MAX_KNOWN_UBUNTU_MAJOR}.x）"
+                    fi
+                    ;;
+            esac
             ;;
         debian)
-            case "$major" in 10|11|12) printf 'debian\n' ;; *) return 1 ;; esac
+            case "$major" in
+                10|11|12)
+                    classify_platform debian verified '已验证的 Debian 版本'
+                    ;;
+                13)
+                    classify_platform debian derived 'Debian 13 仍使用 common-* 与 pam-auth-update，未经本项目实测'
+                    ;;
+                *)
+                    classify_platform '' unsupported "Debian $version 超出已知兼容区间（10-13）"
+                    ;;
+            esac
             ;;
-        centos) [[ "$major" == 7 ]] && printf 'rhel7\n' || return 1 ;;
+        linuxmint|pop|zorin|elementary|kali|raspbian|devuan)
+            classify_platform debian derived "$id 属于 Debian/Ubuntu 衍生版，沿用 common-* PAM 布局"
+            ;;
+    esac
+}
+
+# RHEL family: major 7 uses authconfig with the system-auth-ac symlink layout,
+# major 8 and later use authselect.
+classify_rhel_like_platform() {
+    local id="$1" version="$2" major="$3"
+    case "$id" in
+        centos)
+            case "$major" in
+                7) classify_platform rhel7 verified '已验证的 CentOS 7' ;;
+                8|9|10) classify_platform rhel8plus derived "CentOS $version 与同版本 RHEL 同源，使用 authselect" ;;
+                *) classify_platform '' unsupported "CentOS $version 超出已知兼容区间（7-10）" ;;
+            esac
+            ;;
         rhel|rocky|almalinux)
-            case "$major" in 8|9) printf 'rhel8plus\n' ;; *) return 1 ;; esac
+            case "$major" in
+                8|9) classify_platform rhel8plus verified '已验证的 RHEL 系 authselect 平台' ;;
+                10) classify_platform rhel8plus derived "$id 10 仍使用 authselect，默认 profile 已改为 local，未经本项目实测" ;;
+                *) classify_platform '' unsupported "$id $version 超出已知兼容区间（8-10）" ;;
+            esac
             ;;
+        ol)
+            case "$major" in
+                7) classify_platform rhel7 derived 'Oracle Linux 7 沿用 authconfig 布局，未经本项目实测' ;;
+                8|9|10) classify_platform rhel8plus derived "Oracle Linux $major 沿用 authselect 布局，未经本项目实测" ;;
+                *) classify_platform '' unsupported "Oracle Linux $version 超出已知兼容区间（7-10）" ;;
+            esac
+            ;;
+        fedora)
+            if [[ -n "$major" ]] && (( major >= 36 && major <= MAX_KNOWN_FEDORA_MAJOR )); then
+                classify_platform rhel8plus derived "Fedora $major 由 authselect 强制管理 PAM，未经本项目实测"
+            else
+                classify_platform '' unsupported "Fedora $version 超出已知兼容区间（36-${MAX_KNOWN_FEDORA_MAJOR}）"
+            fi
+            ;;
+        amzn)
+            # VERSION_ID is a release year, not an EL major; match it literally.
+            case "$version" in
+                2|2.*) classify_platform rhel7 derived 'Amazon Linux 2 沿用 RHEL 7 时代 authconfig 布局，未经本项目实测' ;;
+                2023|2023.*) classify_platform rhel8plus derived 'Amazon Linux 2023 以 Fedora 为上游并提供 authselect，未经本项目实测' ;;
+                *) classify_platform '' unsupported "无法识别的 Amazon Linux 版本: $version" ;;
+            esac
+            ;;
+        anolis)
+            case "$major" in
+                8|23|25) classify_platform rhel8plus derived "Anolis OS $version 提供 authselect（版本号不是 EL major），未经本项目实测" ;;
+                *) classify_platform '' unsupported "无法识别的 Anolis OS 版本: $version" ;;
+            esac
+            ;;
+        eurolinux|circle|navylinux|springdale|cloudlinux|miraclelinux)
+            case "$major" in
+                7) classify_platform rhel7 derived "$id $major 属于 EL7 重打包，未经本项目实测" ;;
+                8|9|10) classify_platform rhel8plus derived "$id $major 属于 EL8+ 重打包，未经本项目实测" ;;
+                *) classify_platform '' unsupported "$id $version 超出已知兼容区间（7-10）" ;;
+            esac
+            ;;
+    esac
+}
+
+platform_classification_from_os_release() {
+    local file="$1" id version id_like major
+    local like_debian=0 like_rhel=0
+    [[ -r "$file" ]] || { classify_platform '' unsupported "无法读取 $file"; return 0; }
+    id=$(read_os_release_value "$file" ID) || { classify_platform '' unsupported 'os-release 缺少 ID'; return 0; }
+    version=$(read_os_release_value "$file" VERSION_ID) || { classify_platform '' unsupported 'os-release 缺少 VERSION_ID'; return 0; }
+    id=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+    id_like=$(os_release_id_like "$file")
+    major=$(version_major_number "$version" 2>/dev/null || true)
+
+    case "$id" in
+        ubuntu|debian|linuxmint|pop|zorin|elementary|kali|raspbian|devuan)
+            classify_debian_like_platform "$id" "$version" "$major"
+            return 0
+            ;;
+        centos|rhel|rocky|almalinux|ol|fedora|amzn|anolis|eurolinux|circle|navylinux|springdale|cloudlinux|miraclelinux)
+            classify_rhel_like_platform "$id" "$version" "$major"
+            return 0
+            ;;
+        openeuler)
+            classify_platform '' unsupported 'openEuler 的 PAM 由厂商策略管理，authselect 接管未经验证，可能导致 root 无法登录'
+            return 0
+            ;;
+        kylin|uos|deepin)
+            classify_platform '' unsupported "$id 同一发行版 ID 覆盖多种不同底层（EL7/EL8/openEuler/Debian），无法安全推断 PAM 布局"
+            return 0
+            ;;
+        opensuse*|sles|sled|suse)
+            classify_platform '' unsupported 'SUSE 使用 pam-config 管理 PAM，与本脚本的实现不兼容'
+            return 0
+            ;;
+        alpine)
+            classify_platform '' unsupported 'Alpine 默认不使用 glibc/PAM 认证栈'
+            return 0
+            ;;
+        arch|manjaro|gentoo|nixos|void)
+            classify_platform '' unsupported "$id 属于滚动更新或非 PAM 托管家族，没有稳定的 PAM 布局合同"
+            return 0
+            ;;
+    esac
+
+    id_like_contains "$id_like" debian && like_debian=1
+    id_like_contains "$id_like" ubuntu && like_debian=1
+    id_like_contains "$id_like" rhel && like_rhel=1
+    id_like_contains "$id_like" centos && like_rhel=1
+    id_like_contains "$id_like" fedora && like_rhel=1
+
+    if (( like_debian && like_rhel )); then
+        classify_platform '' unsupported "$id 的 ID_LIKE 同时命中 Debian 和 RHEL 家族，无法安全推断"
+    elif (( like_debian )); then
+        classify_platform debian derived "未知发行版 $id，依据 ID_LIKE 推断为 Debian PAM 布局"
+    elif (( like_rhel )); then
+        classify_platform rhel8plus derived "未知发行版 $id，依据 ID_LIKE 推断为 authselect PAM 布局"
+    else
+        classify_platform '' unsupported "未知发行版 $id，且 ID_LIKE 未命中任何受支持家族"
+    fi
+}
+
+# Splits a classification record into family, tier and reason. TAB is IFS
+# whitespace, so `IFS=$'\t' read` would drop the leading empty family field on
+# unsupported records and shift tier into its place.
+split_platform_classification() {
+    # Locals are prefixed because callers pass their own variable names in, and
+    # a collision would make printf -v write to this scope instead of theirs.
+    local _spc_record="$1" _spc_family_var="$2" _spc_tier_var="$3" _spc_reason_var="$4" _spc_rest
+    _spc_rest=${_spc_record#*$'\t'}
+    printf -v "$_spc_family_var" '%s' "${_spc_record%%$'\t'*}"
+    printf -v "$_spc_tier_var" '%s' "${_spc_rest%%$'\t'*}"
+    printf -v "$_spc_reason_var" '%s' "${_spc_record##*$'\t'}"
+}
+
+platform_classification_family() {
+    local record family tier reason
+    record=$(platform_classification_from_os_release "$1")
+    split_platform_classification "$record" family tier reason
+    printf '%s\n' "$family"
+}
+
+platform_classification_tier() {
+    local record family tier reason
+    record=$(platform_classification_from_os_release "$1")
+    split_platform_classification "$record" family tier reason
+    printf '%s\n' "$tier"
+}
+
+platform_family_from_os_release() {
+    local record family tier reason
+    record=$(platform_classification_from_os_release "$1")
+    split_platform_classification "$record" family tier reason
+    case "$family:$tier" in
+        debian:verified|debian:derived|rhel7:verified|rhel7:derived|rhel8plus:verified|rhel8plus:derived) ;;
         *) return 1 ;;
     esac
+    printf '%s\n' "$family"
 }
 
 detect_platform() {
@@ -95,10 +294,42 @@ detect_platform() {
     [[ -r "$file" ]] || die "无法读取 $file"
     PLATFORM_ID=$(read_os_release_value "$file" ID) || die "os-release 缺少 ID"
     PLATFORM_VERSION=$(read_os_release_value "$file" VERSION_ID) || die "os-release 缺少 VERSION_ID"
-    PLATFORM_FAMILY=$(platform_family_from_os_release "$file") || die "不支持的系统: $PLATFORM_ID $PLATFORM_VERSION"
-    if [[ "$PLATFORM_FAMILY" == rhel7 ]]; then
-        warn "CentOS 7 已停止上游安全更新；本脚本仍完整支持，但建议尽快升级系统"
+    # TAB is IFS whitespace, so `IFS=$'\t' read` would drop the leading empty
+    # family field and shift tier into it. Split on the literal separator.
+    local classification
+    classification=$(platform_classification_from_os_release "$file")
+    split_platform_classification "$classification" PLATFORM_FAMILY PLATFORM_TIER PLATFORM_REASON
+    # An unrecognised tier means the dispatch tables disagree; refuse rather
+    # than fall through to PAM edits with an unknown family.
+    case "$PLATFORM_TIER" in
+        verified|derived)
+            case "$PLATFORM_FAMILY" in
+                debian|rhel7|rhel8plus) ;;
+                *) die "无法判定平台家族: $PLATFORM_ID $PLATFORM_VERSION" ;;
+            esac
+            ;;
+        unsupported)
+            die "不支持的系统: $PLATFORM_ID $PLATFORM_VERSION（$PLATFORM_REASON）"
+            ;;
+        *)
+            die "无法判定平台兼容性: $PLATFORM_ID $PLATFORM_VERSION"
+            ;;
+    esac
+    if [[ "$PLATFORM_TIER" == derived ]]; then
+        if (( ! ALLOW_UNVERIFIED_PLATFORM )); then
+            warn "未实测的平台: $PLATFORM_ID $PLATFORM_VERSION -> $PLATFORM_FAMILY（$PLATFORM_REASON）"
+            die "如确认承担风险，请追加 --allow-unverified-platform 重新执行"
+        fi
+        # detect_platform runs before the wizard and again from apply_hardening.
+        if (( ! PLATFORM_WARNED )); then
+            warn "平台未经本项目实测: $PLATFORM_ID $PLATFORM_VERSION -> $PLATFORM_FAMILY（$PLATFORM_REASON）"
+            warn "已按 --allow-unverified-platform 继续；PAM 结构校验仍会强制执行"
+        fi
     fi
+    if [[ "$PLATFORM_FAMILY" == rhel7 ]] && (( ! PLATFORM_WARNED )); then
+        warn "$PLATFORM_ID $PLATFORM_VERSION 属于 EL7 代际，已停止上游安全更新；本脚本仍完整支持，但建议尽快升级系统"
+    fi
+    PLATFORM_WARNED=1
     local required
     for required in systemctl sshd tar flock; do
         command -v "$required" >/dev/null 2>&1 || die "缺少必需命令: $required"
